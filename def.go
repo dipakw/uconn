@@ -1,0 +1,45 @@
+package uconn
+
+import (
+	"net"
+	"sync"
+)
+
+const (
+	ALGO_AES256_GCM uint8 = 1
+	ALGO_AES128_GCM uint8 = 2
+	MAX_CHUNK_SIZE  int   = 32 * 1024
+)
+
+type Conn interface {
+	net.Conn
+
+	Encrypt(p []byte) (d []byte, err error)
+	Decrypt(p []byte) (d []byte, err error)
+}
+
+type Opts struct {
+	Algo uint8
+	Key  []byte
+}
+
+type _keys struct {
+	forData []byte
+	forSize []byte
+	forHmac []byte
+}
+
+type _conn struct {
+	conn   net.Conn
+	opt    *Opts
+	keys   *_keys
+	ord    []byte
+	mu     sync.Mutex
+	remain int
+	cursor int
+	unread []byte
+}
+
+type _algo struct {
+	keysize int
+}

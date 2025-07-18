@@ -21,6 +21,7 @@ type Conn interface {
 type Opts struct {
 	Algo uint8
 	Key  []byte
+	Size uint16 // Max chunk size.
 }
 
 type _keys struct {

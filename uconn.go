@@ -1,12 +1,10 @@
 package uconn
 
 import (
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"net"
-	"strconv"
 	"sync"
 	"time"
 )
@@ -21,43 +19,34 @@ var algos = map[uint8]*_algo{
 	},
 }
 
-var mu sync.Mutex
-var keys = map[string]*_keys{}
-
 func New(c net.Conn, opts *Opts) (Conn, error) {
 	if opts == nil {
 		return nil, errors.New("opts required")
 	}
 
+	if opts.Size == 0 {
+		opts.Size = DEFAULT_CHUNK_SIZE
+	}
+
 	var algo = algos[opts.Algo]
 
 	if algo == nil {
-		return nil, errors.New("unsupported algo")
+		return nil, fmt.Errorf("unsupported algo: %d", opts.Algo)
 	}
 
-	mu.Lock()
-
-	var key = hex.EncodeToString(opts.Key) + strconv.Itoa(int(opts.Algo))
-	var useKeys *_keys = keys[key]
-
-	if useKeys == nil {
-		useKeys = &_keys{
-			forData: hkdfkey("for-data", opts.Key, algo.keysize),
-			forSize: hkdfkey("for-size", opts.Key, 32),
-			forHmac: hkdfkey("for-hmac", opts.Key, 32),
-		}
-
-		keys[key] = useKeys
+	var useKeys = &_keys{
+		forData: hkdfkey("for-data", opts.Key, algo.keysize),
+		forSize: hkdfkey("for-size", opts.Key, 32),
+		forHmac: hkdfkey("for-hmac", opts.Key, 32),
 	}
-
-	mu.Unlock()
 
 	conn := &_conn{
-		conn: c,
-		opt:  opts,
-		keys: useKeys,
-		ord:  genPerm(hkdfkey("for-shuff", opts.Key, algo.keysize), 12),
-		mu:   sync.Mutex{},
+		conn:   c,
+		opt:    opts,
+		keys:   useKeys,
+		ord:    genPerm(hkdfkey("for-shuff", opts.Key, algo.keysize), 12),
+		mu:     sync.Mutex{},
+		unread: make([]byte, 0, opts.Size), // Pre-allocate buffer
 	}
 
 	return conn, nil
@@ -71,7 +60,9 @@ func (c *_conn) Read(p []byte) (int, error) {
 		n := copy(p, c.unread[c.cursor:])
 		c.cursor += n
 		c.remain -= n
-
+		if c.remain == 0 {
+			c.unread = c.unread[:0] // Reset buffer
+		}
 		return n, nil
 	}
 
@@ -81,13 +72,17 @@ func (c *_conn) Read(p []byte) (int, error) {
 	_, err := io.ReadFull(c.conn, buff)
 
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("failed to read size header: %w", err)
 	}
 
 	size, err := c.decryptSize(buff)
 
 	if err != nil {
-		return 0, fmt.Errorf("failed to decrypt size: %s", err.Error())
+		return 0, fmt.Errorf("failed to decrypt size: %w", err)
+	}
+
+	if size > uint16(c.opt.Size) {
+		return 0, fmt.Errorf("data size %d exceeds max chunk size %d", size, c.opt.Size)
 	}
 
 	buff = make([]byte, size)
@@ -95,13 +90,13 @@ func (c *_conn) Read(p []byte) (int, error) {
 	_, err = io.ReadFull(c.conn, buff)
 
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("failed to read data: %w", err)
 	}
 
 	data, err := c.Decrypt(buff)
 
 	if err != nil {
-		return 0, fmt.Errorf("failed to decrypt data: %s", err.Error())
+		return 0, fmt.Errorf("failed to decrypt data: %w", err)
 	}
 
 	n := copy(p, data)
@@ -110,7 +105,7 @@ func (c *_conn) Read(p []byte) (int, error) {
 		c.mu.Lock()
 		c.remain = len(data) - n
 		c.cursor = 0
-		c.unread = data[n:]
+		c.unread = append(c.unread[:0], data[n:]...)
 		c.mu.Unlock()
 	}
 
@@ -119,8 +114,9 @@ func (c *_conn) Read(p []byte) (int, error) {
 
 func (c *_conn) Write(p []byte) (int, error) {
 	pLen := len(p)
+	dataChunkSize := int(c.opt.Size) - 28
 
-	if pLen <= MAX_CHUNK_SIZE {
+	if pLen <= dataChunkSize {
 		return c.writeChunk(p)
 	}
 
@@ -132,8 +128,8 @@ func (c *_conn) Write(p []byte) (int, error) {
 	done := false
 
 	for {
-		from := i * MAX_CHUNK_SIZE
-		to := from + MAX_CHUNK_SIZE
+		from := i * dataChunkSize
+		to := from + dataChunkSize
 
 		if to > pLen {
 			to = pLen
@@ -147,6 +143,7 @@ func (c *_conn) Write(p []byte) (int, error) {
 		}
 
 		n += wn
+		i++
 
 		if done {
 			break
@@ -160,10 +157,14 @@ func (c *_conn) writeChunk(p []byte) (int, error) {
 	pLen := len(p)    // Payload length.
 	eLen := 28 + pLen // Encrypted length.
 
+	if pLen > int(c.opt.Size) {
+		return 0, fmt.Errorf("chunk size %d exceeds max %d", pLen, c.opt.Size)
+	}
+
 	size, err := c.encryptSize(uint16(eLen))
 
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("failed to encrypt size: %w", err)
 	}
 
 	b := make([]byte, 12+eLen)
@@ -171,14 +172,14 @@ func (c *_conn) writeChunk(p []byte) (int, error) {
 	data, err := c.Encrypt(p)
 
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("failed to encrypt data: %w", err)
 	}
 
 	copy(b, size)
 	copy(b[12:], data)
 
 	if _, err := c.conn.Write(b); err != nil {
-		return 0, err
+		return 0, fmt.Errorf("failed to write data: %w", err)
 	}
 
 	return pLen, nil
@@ -209,27 +210,25 @@ func (c *_conn) SetWriteDeadline(t time.Time) error {
 }
 
 func (c *_conn) Encrypt(p []byte) ([]byte, error) {
-	if c.opt.Algo == ALGO_AES128_GCM {
+	switch c.opt.Algo {
+	case ALGO_AES128_GCM:
 		return aes128gcmEnc(p, c.opt.Key)
-	}
-
-	if c.opt.Algo == ALGO_AES256_GCM {
+	case ALGO_AES256_GCM:
 		return aes256gcmEnc(p, c.opt.Key)
+	default:
+		return nil, fmt.Errorf("unsupported algo: %d", c.opt.Algo)
 	}
-
-	return nil, errors.New("unsupported algo")
 }
 
 func (c *_conn) Decrypt(p []byte) ([]byte, error) {
-	if c.opt.Algo == ALGO_AES128_GCM {
+	switch c.opt.Algo {
+	case ALGO_AES128_GCM:
 		return aes128gcmDec(p, c.opt.Key)
-	}
-
-	if c.opt.Algo == ALGO_AES256_GCM {
+	case ALGO_AES256_GCM:
 		return aes256gcmDec(p, c.opt.Key)
+	default:
+		return nil, fmt.Errorf("unsupported algo: %d", c.opt.Algo)
 	}
-
-	return nil, errors.New("unsupported algo")
 }
 
 func (c *_conn) encryptSize(n uint16) ([]byte, error) {

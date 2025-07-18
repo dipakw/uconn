@@ -6,9 +6,9 @@ import (
 )
 
 const (
-	ALGO_AES256_GCM uint8 = 1
-	ALGO_AES128_GCM uint8 = 2
-	MAX_CHUNK_SIZE  int   = 32 * 1024
+	ALGO_AES256_GCM    uint8  = 1
+	ALGO_AES128_GCM    uint8  = 2
+	DEFAULT_CHUNK_SIZE uint16 = 32 * 1024
 )
 
 type Conn interface {

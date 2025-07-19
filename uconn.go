@@ -72,7 +72,7 @@ func (c *_conn) Read(p []byte) (int, error) {
 	_, err := io.ReadFull(c.conn, buff)
 
 	if err != nil {
-		return 0, fmt.Errorf("failed to read size header: %w", err)
+		return 0, err
 	}
 
 	size, err := c.decryptSize(buff)
@@ -90,7 +90,7 @@ func (c *_conn) Read(p []byte) (int, error) {
 	_, err = io.ReadFull(c.conn, buff)
 
 	if err != nil {
-		return 0, fmt.Errorf("failed to read data: %w", err)
+		return 0, err
 	}
 
 	data, err := c.Decrypt(buff)
